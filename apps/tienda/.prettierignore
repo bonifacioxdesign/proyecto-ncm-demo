@@ -1,0 +1,8 @@
+.next/
+.claude/
+node_modules/
+coverage/
+pnpm-lock.yaml
+prisma/migrations/
+public/
+next-env.d.ts

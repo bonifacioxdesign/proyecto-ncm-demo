@@ -1,0 +1,373 @@
+"use server";
+
+import { z } from "zod";
+import { revalidatePath } from "next/cache";
+import { after } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { EventStatus } from "@/lib/generated/prisma/enums";
+import { createProducts, updateProducts, getLatestProduct, type N1COProductSync } from "@/lib/n1co";
+import { uploadImage, deleteImage } from "@/lib/s3";
+import { requireActiveAdmin } from "@/lib/authz";
+import path from "path";
+
+function revalidateEventViews() {
+  revalidatePath("/");
+  revalidatePath("/admin/panel-de-control");
+  revalidatePath("/admin/eventos");
+}
+
+export async function getEvents({
+  page = 1,
+  pageSize = 10,
+  name,
+  categoryId,
+  featured,
+  includeInactive,
+}: {
+  page?: number;
+  pageSize?: number;
+  name?: string;
+  categoryId?: string;
+  featured?: boolean;
+  includeInactive?: boolean;
+} = {}) {
+  const safePage = Math.max(1, Math.floor(page));
+  const safePageSize = Math.min(100, Math.max(1, Math.floor(pageSize)));
+  const skip = (safePage - 1) * safePageSize;
+
+  const admin = includeInactive ? await requireActiveAdmin() : null;
+  const canSeeInactive = includeInactive && !!admin;
+
+  const where = {
+    ...(name && name.trim() ? { name: { contains: name.trim() } } : {}),
+    ...(categoryId ? { categoryId } : {}),
+    ...(featured ? { featured: true } : {}),
+    status: canSeeInactive
+      ? { in: [EventStatus.ACTIVE, EventStatus.DEACTIVE] }
+      : EventStatus.ACTIVE,
+  };
+
+  // Two independent reads — no atomicity needed. Avoid $transaction so we
+  // don't pay the interactive-transaction cost on Prisma Postgres pooled
+  // connections (which often times out with P2028 on cold starts).
+  const [events, totalCount] = await Promise.all([
+    prisma.event.findMany({
+      where,
+      include: {
+        category: true,
+        screenings: { orderBy: [{ date: "asc" }, { time: "asc" }] },
+      },
+      orderBy: { createdAt: "desc" },
+      skip,
+      take: safePageSize,
+    }),
+    prisma.event.count({ where }),
+  ]);
+
+  return {
+    events,
+    totalCount,
+    page: safePage,
+    pageSize: safePageSize,
+    totalPages: Math.max(1, Math.ceil(totalCount / safePageSize)),
+  };
+}
+
+export async function getEventsStatusCounts() {
+  const admin = await requireActiveAdmin();
+  if (!admin) return { active: 0, inactive: 0 };
+
+  const [active, inactive] = await Promise.all([
+    prisma.event.count({ where: { status: EventStatus.ACTIVE } }),
+    prisma.event.count({ where: { status: EventStatus.DEACTIVE } }),
+  ]);
+  return { active, inactive };
+}
+
+export async function deleteEvent(id: string) {
+  const admin = await requireActiveAdmin();
+  if (!admin) return { error: "No autorizado" };
+
+  const event = await prisma.event.findUnique({ where: { id } });
+  if (!event) return { error: "Event not found" };
+
+  await prisma.event.update({ where: { id }, data: { status: EventStatus.DELETED } });
+
+  revalidateEventViews();
+  return { success: true };
+}
+
+const setEventStatusSchema = z.object({
+  status: z.enum([EventStatus.ACTIVE, EventStatus.DEACTIVE]),
+});
+
+export async function setEventStatus(id: string, status: "ACTIVE" | "DEACTIVE") {
+  const admin = await requireActiveAdmin();
+  if (!admin) return { error: "No autorizado" };
+
+  const parsed = setEventStatusSchema.safeParse({ status });
+  if (!parsed.success) return { error: "Estado inválido" };
+
+  try {
+    await prisma.event.update({ where: { id }, data: { status: parsed.data.status } });
+  } catch {
+    return { error: "No se pudo actualizar el estado del evento" };
+  }
+
+  revalidateEventViews();
+  return { success: true };
+}
+
+const stringBoolean = z.preprocess((v) => v === "true" || v === true, z.boolean());
+
+const screeningInputSchema = z.object({
+  id: z.string().uuid().optional(),
+  date: z.string().min(1),
+  time: z.string().min(1),
+  availableTickets: z.coerce.number().int().nonnegative(),
+});
+
+const screeningsField = z.preprocess(
+  (v) => (typeof v === "string" ? JSON.parse(v) : v),
+  z.array(screeningInputSchema).default([]),
+);
+
+const eventFieldsSchema = z.object({
+  sku: z.string().min(1),
+  name: z.string().min(1),
+  description: z.string().min(1),
+  longDescription: z.string().min(1),
+  categoryId: z.string().uuid("Categoría inválida"),
+  venue: z.string().min(1),
+  city: z.string().min(1),
+  priceInCents: z.coerce.number().int().positive(),
+  screenings: screeningsField,
+  featured: stringBoolean.default(false),
+  syncN1co: stringBoolean.default(false),
+  n1coProductId: z.string().optional().default(""),
+});
+
+function toN1COProduct(
+  event: Omit<z.infer<typeof eventFieldsSchema>, "syncN1co" | "n1coProductId" | "categoryId"> & {
+    image: string;
+    categorySlug: string;
+  },
+): N1COProductSync {
+  const stock = event.screenings.reduce((n, s) => n + s.availableTickets, 0);
+  return {
+    sku: event.sku,
+    name: event.name,
+    description: event.description,
+    ...(stock > 0 ? { stock } : {}),
+    price: event.priceInCents / 100,
+    collections: [event.categorySlug],
+    image: event.image,
+    enable: true,
+    salesChannel: ["PaymentLink"],
+    locations: [{ locationCode: event.venue, isAvailable: true }],
+    modifiers: [],
+    images: [event.image],
+  };
+}
+
+const FIELD_LABELS: Record<string, string> = {
+  sku: "SKU",
+  n1coProductId: "ID de N1co",
+};
+
+function extractConflictFields(target: unknown): string[] {
+  if (Array.isArray(target)) return target as string[];
+  if (typeof target === "string") {
+    return Object.keys(FIELD_LABELS).filter((f) => target.toLowerCase().includes(f.toLowerCase()));
+  }
+  return [];
+}
+
+function formatPrismaError(error: unknown): Record<string, string[]> {
+  if (error && typeof error === "object" && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    if (code === "P2002") {
+      const target = (error as { meta?: { target?: unknown } }).meta?.target;
+      const fields = extractConflictFields(target);
+      const field = fields[0];
+      if (field) {
+        const label = FIELD_LABELS[field] ?? field;
+        return { [field]: [`Ya existe un evento con este ${label}`] };
+      }
+      return { form: ["Ya existe un evento con uno de los datos ingresados"] };
+    }
+    if (code === "P2025") {
+      return { form: ["El evento no existe o fue eliminado"] };
+    }
+    if (code === "P2003") {
+      return { form: ["La categoría seleccionada no existe"] };
+    }
+  }
+  console.error("Unexpected Prisma error:", error);
+  return { form: ["Ocurrió un error al guardar el evento. Intenta de nuevo."] };
+}
+
+async function uploadEventImage(file: File, sku: string): Promise<string> {
+  const buffer = Buffer.from(await file.arrayBuffer());
+  const ext = path.extname(file.name) || ".jpg";
+  const key = `events/${sku}-${Date.now()}${ext}`;
+  return uploadImage(buffer, key, file.type || "image/jpeg");
+}
+
+export async function createEvent(formData: FormData) {
+  const admin = await requireActiveAdmin();
+  if (!admin) return { error: { form: ["No autorizado"] } };
+
+  const fields = Object.fromEntries(formData.entries());
+  const imageFile = formData.get("image") as File | null;
+
+  if (!imageFile || imageFile.size === 0) {
+    return { error: { image: ["Image file is required"] } };
+  }
+
+  const parsed = eventFieldsSchema.safeParse(fields);
+  if (!parsed.success) {
+    return { error: parsed.error.flatten().fieldErrors };
+  }
+
+  const category = await prisma.category.findUnique({ where: { id: parsed.data.categoryId } });
+  if (!category) {
+    return { error: { categoryId: ["La categoría seleccionada no existe"] } };
+  }
+
+  const imageUrl = await uploadEventImage(imageFile, parsed.data.sku);
+  const { syncN1co, n1coProductId, screenings, ...eventFields } = parsed.data;
+  const eventData = {
+    ...eventFields,
+    image: imageUrl,
+    n1coProductId: syncN1co && n1coProductId ? n1coProductId : null,
+  };
+
+  let event: Awaited<ReturnType<typeof prisma.event.create>>;
+  try {
+    event = await prisma.event.create({ data: eventData });
+    if (screenings.length) {
+      await prisma.screening.createMany({
+        data: screenings.map((s) => ({
+          eventId: event.id,
+          date: s.date,
+          time: s.time,
+          availableTickets: s.availableTickets,
+        })),
+      });
+    }
+  } catch (error) {
+    await deleteImage(imageUrl).catch(() => {});
+    return { error: formatPrismaError(error) };
+  }
+
+  after(async () => {
+    try {
+      const { categoryId: _cid, ...rest } = eventFields;
+      await createProducts([
+        toN1COProduct({ ...rest, screenings, image: imageUrl, categorySlug: category.slug }),
+      ]);
+
+      if (!event.n1coProductId) {
+        const latest = await getLatestProduct();
+        if (latest) {
+          await prisma.event.update({
+            where: { id: event.id },
+            data: { n1coProductId: String(latest.productId) },
+          });
+        }
+      }
+    } catch (error) {
+      console.warn("N1CO sync failed on create:", error instanceof Error ? error.message : error);
+    }
+  });
+
+  revalidateEventViews();
+  return { event };
+}
+
+export async function updateEvent(id: string, formData: FormData) {
+  const admin = await requireActiveAdmin();
+  if (!admin) return { error: { form: ["No autorizado"] } };
+
+  const fields = Object.fromEntries(formData.entries());
+  const imageFile = formData.get("image") as File | null;
+
+  const parsed = eventFieldsSchema.safeParse(fields);
+  if (!parsed.success) {
+    return { error: parsed.error.flatten().fieldErrors };
+  }
+
+  const category = await prisma.category.findUnique({ where: { id: parsed.data.categoryId } });
+  if (!category) {
+    return { error: { categoryId: ["La categoría seleccionada no existe"] } };
+  }
+
+  const existing = await prisma.event.findUniqueOrThrow({ where: { id } });
+
+  let imageUrl: string;
+  if (imageFile && imageFile.size > 0) {
+    await deleteImage(existing.image);
+    imageUrl = await uploadEventImage(imageFile, parsed.data.sku);
+  } else {
+    imageUrl = existing.image;
+  }
+
+  const { syncN1co, n1coProductId, screenings, ...eventFields } = parsed.data;
+  const eventData = {
+    ...eventFields,
+    image: imageUrl,
+    n1coProductId: syncN1co && n1coProductId ? n1coProductId : null,
+  };
+  let event: Awaited<ReturnType<typeof prisma.event.update>>;
+  try {
+    event = await prisma.event.update({ where: { id }, data: eventData });
+
+    const incomingIds = screenings.filter((s) => s.id).map((s) => s.id!);
+    await prisma.screening.deleteMany({
+      where: {
+        eventId: id,
+        ...(incomingIds.length ? { id: { notIn: incomingIds } } : {}),
+      },
+    });
+    for (const s of screenings) {
+      if (s.id) {
+        await prisma.screening.update({
+          where: { id: s.id },
+          data: { date: s.date, time: s.time, availableTickets: s.availableTickets },
+        });
+      } else {
+        await prisma.screening.create({
+          data: { eventId: id, date: s.date, time: s.time, availableTickets: s.availableTickets },
+        });
+      }
+    }
+  } catch (error) {
+    if (imageFile && imageFile.size > 0 && imageUrl !== existing.image) {
+      await deleteImage(imageUrl).catch(() => {});
+    }
+    return { error: formatPrismaError(error) };
+  }
+
+  const { categoryId: _cid, ...rest } = eventFields;
+  const n1coProduct = toN1COProduct({
+    ...rest,
+    screenings,
+    image: imageUrl,
+    categorySlug: category.slug,
+  });
+  after(async () => {
+    try {
+      if (event.n1coProductId) {
+        await updateProducts([n1coProduct]);
+      } else {
+        await createProducts([n1coProduct]);
+      }
+    } catch (error) {
+      console.warn("N1CO sync failed on update:", error instanceof Error ? error.message : error);
+    }
+  });
+
+  revalidateEventViews();
+  return { event };
+}

@@ -1,0 +1,73 @@
+"use client";
+
+import { useActionState } from "react";
+import { useRouter } from "next/navigation";
+import { useEffect } from "react";
+import Link from "next/link";
+import { login } from "@/app/actions/auth";
+import { Role } from "@/lib/generated/prisma/enums";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+
+function isSafeFrom(from: string | undefined): from is string {
+  return !!from && from.startsWith("/") && !from.startsWith("//");
+}
+
+function defaultForRole(role: Role | undefined): string {
+  if (role === "ADMIN") return "/admin";
+  // CLIENT and any future roles fall back to home for now.
+  return "/";
+}
+
+export function LoginForm({ from, resetSuccess }: { from?: string; resetSuccess?: boolean }) {
+  const router = useRouter();
+  const [state, formAction, isPending] = useActionState(login, null);
+
+  useEffect(() => {
+    if (state?.success) {
+      const target = isSafeFrom(from) ? from : defaultForRole(state.role);
+      router.push(target);
+    }
+  }, [state, router, from]);
+
+  return (
+    <Card className="w-full max-w-md">
+      <CardHeader className="text-center">
+        <CardTitle className="text-2xl font-bold">Iniciar Sesión</CardTitle>
+        <CardDescription>Ingresa tus credenciales para continuar</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form action={formAction} className="space-y-4">
+          {resetSuccess && (
+            <div className="rounded-md bg-green-500/10 p-3 text-sm text-green-600">
+              Tu contraseña fue actualizada correctamente. Ya puedes iniciar sesión.
+            </div>
+          )}
+          {state && !state.success && (
+            <div className="bg-destructive/10 text-destructive rounded-md p-3 text-sm">
+              {state.error}
+            </div>
+          )}
+          <div className="space-y-2">
+            <Label htmlFor="email">Correo electrónico</Label>
+            <Input id="email" name="email" type="email" placeholder="correo@ejemplo.com" required />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="password">Contraseña</Label>
+            <Input id="password" name="password" type="password" placeholder="••••••••" required />
+          </div>
+          <Button type="submit" className="w-full" disabled={isPending}>
+            {isPending ? "Ingresando..." : "Ingresar"}
+          </Button>
+        </form>
+        <p className="text-muted-foreground mt-4 text-center text-sm">
+          <Link href="/forgot-password" className="hover:text-primary underline underline-offset-4">
+            ¿Olvidaste tu contraseña?
+          </Link>
+        </p>
+      </CardContent>
+    </Card>
+  );
+}

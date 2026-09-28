@@ -1,0 +1,29 @@
+import { getFeaturedEvents, getEvents } from "@/lib/events";
+import { getCategories } from "@/app/actions/categories";
+import Header from "@/components/header";
+import HeroSlider from "@/components/hero-slider";
+import EventGrid from "@/components/event-grid";
+import EventDetailModal from "@/components/event-detail-modal";
+import Footer from "@/components/footer";
+
+export const revalidate = 60;
+
+export default async function HomePage() {
+  const [featured, events, categories] = await Promise.all([
+    getFeaturedEvents(),
+    getEvents(),
+    getCategories(),
+  ]);
+
+  return (
+    <div className="bg-background min-h-screen">
+      <Header />
+      <main className="pt-16">
+        <HeroSlider events={featured} />
+        <EventGrid events={events} categories={categories} />
+      </main>
+      <Footer />
+      <EventDetailModal />
+    </div>
+  );
+}

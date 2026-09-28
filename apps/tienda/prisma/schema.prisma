@@ -1,0 +1,186 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+enum Role {
+  ADMIN
+  CLIENT
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+  REDEEMED
+}
+
+enum TicketStatus {
+  ISSUED
+  REDEEMED
+}
+
+enum EventStatus {
+  ACTIVE
+  DEACTIVE
+  DELETED
+}
+
+enum CategoryStatus {
+  ACTIVE
+  DEACTIVE
+  DELETED
+}
+
+enum UserStatus {
+  ACTIVE
+  DEACTIVE
+}
+
+model Category {
+  id          String         @id @default(uuid()) @db.Char(36)
+  slug        String         @unique
+  name        String
+  color       String
+  status      CategoryStatus @default(ACTIVE)
+  description String?  @db.Text
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  events Event[]
+
+  @@index([status])
+  @@map("categories")
+}
+
+model User {
+  id        String     @id @default(uuid()) @db.Char(36)
+  email     String     @unique
+  name      String
+  password  String
+  role      Role       @default(CLIENT)
+  status    UserStatus @default(ACTIVE)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  orders              Order[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@index([status])
+  @@map("users")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Char(36)
+  userId    String    @db.Char(36)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+model Event {
+  id              String   @id @default(uuid()) @db.Char(36)
+  n1coProductId   String?  @unique
+  sku             String   @unique
+  name            String
+  description     String   @db.Text
+  longDescription String   @db.Text
+  categoryId      String   @db.Char(36)
+  category        Category @relation(fields: [categoryId], references: [id])
+  image           String
+  venue           String
+  city            String
+  priceInCents    Int
+  featured        Boolean     @default(false)
+  status          EventStatus @default(ACTIVE)
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  orderItems OrderItem[]
+  screenings Screening[]
+
+  @@index([categoryId])
+  @@index([featured])
+  @@index([status])
+  @@map("events")
+}
+
+model Screening {
+  id               String   @id @default(uuid()) @db.Char(36)
+  eventId          String   @db.Char(36)
+  event            Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  date             String
+  time             String
+  availableTickets Int
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  orderItems OrderItem[]
+
+  @@index([eventId])
+  @@index([date])
+  @@map("screenings")
+}
+
+model Order {
+  id              String      @id @default(uuid()) @db.Char(36)
+  userId          String?     @db.Char(36)
+  user            User?       @relation(fields: [userId], references: [id])
+  emailSentAt     DateTime?
+  status          OrderStatus @default(PENDING)
+  totalInCents    Int
+  stripeSessionId String?     @unique
+  n1coSessionId   String?     @unique
+  buyerName       String?
+  buyerEmail      String?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  items OrderItem[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("orders")
+}
+
+model OrderItem {
+  id           String     @id @default(uuid()) @db.Char(36)
+  orderId      String     @db.Char(36)
+  order        Order      @relation(fields: [orderId], references: [id])
+  eventId      String     @db.Char(36)
+  event        Event      @relation(fields: [eventId], references: [id])
+  screeningId  String?    @db.Char(36)
+  screening    Screening? @relation(fields: [screeningId], references: [id])
+  quantity     Int
+  priceInCents Int
+
+  tickets Ticket[]
+
+  @@unique([orderId, eventId, screeningId])
+  @@index([eventId])
+  @@index([screeningId])
+  @@map("order_items")
+}
+
+model Ticket {
+  id          String       @id @default(uuid()) @db.Char(36)
+  orderItemId String       @db.Char(36)
+  orderItem   OrderItem    @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  token       String       @unique
+  status      TicketStatus @default(ISSUED)
+  redeemedAt  DateTime?
+  createdAt   DateTime     @default(now())
+
+  @@index([orderItemId])
+  @@index([status])
+  @@map("tickets")
+}

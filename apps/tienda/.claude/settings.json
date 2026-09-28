@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm i *)",
+      "Bash(pnpm db:seed)",
+      "Bash(xargs cat)",
+      "Bash(git restore *)",
+      "Bash(echo \"EXIT=$?\")"
+    ]
+  }
+}
